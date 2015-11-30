@@ -1,6 +1,6 @@
 import os, pegs, strutils, streams, xmltree, xmlparser, stopwatch, asyncdispatch, tables, logging, json, times
 import ../rethinkdb.nim/rethinkdb
-setLogFilter(lvlNone)
+setLogFilter(lvlWarn)
 
 let
   startNode = peg"\s* '<node'"
@@ -47,6 +47,7 @@ proc processNode(node: XmlNode) {.async.} =
 
   let
     id = parseInt(node.attr("id"))
+    version = parseInt(node.attr("version"))
     changeset = parseInt(node.attr("changeset"))
     long = parseFloat(node.attr("lon"))
     lat = parseFloat(node.attr("lat"))
@@ -60,33 +61,111 @@ proc processNode(node: XmlNode) {.async.} =
     discard await r.table("nodes").insert(&*{
       "id": id,
       "loc": r.point(long, lat),
+      "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "tags": tags
-    }).run()
+    }).run(durability="soft", noreply=true)
   elif ret["changeset"].num != changeset:
     discard await r.table("nodes").get(id).update(&*{
       "loc": r.point(long, lat),
+      "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "tags": tags
-    }).run()
+    }).run(durability="soft", noreply=true)
+#  else:
+#    discard await r.table("nodes").get(id).update(&*{"timestamp": ts}).run()
+
+proc processWay(node: XmlNode) {.async.} =
+  var nodes: seq[int] = @[]
+  var tags = newTable[string, MutableDatum]()
+  for n in node.items:
+    if n.tag() == "tag":
+      tags[n.attr("k")] = &n.attr("v")
+    if n.tag() == "nd":
+      nodes.add(parseInt(n.attr("ref")))
+
+  let
+    id = parseInt(node.attr("id"))
+    version = parseInt(node.attr("version"))
+    changeset = parseInt(node.attr("changeset"))
+  var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
+  ts.timezone = 0
+
+  var ret = await r.table("ways").get(id).run()
+
+  if ret.kind == JNull:
+    discard await r.table("ways").insert(&*{
+      "id": id,
+      "version": version,
+      "timestamp": ts,
+      "changeset": changeset,
+      "nodes": nodes
+    }).run(durability="soft", noreply=true)
+  elif ret["changeset"].num != changeset:
+    discard await r.table("ways").get(id).update(&*{
+      "version": version,
+      "timestamp": ts,
+      "changeset": changeset,
+      "nodes": nodes
+    }).run(durability="soft", noreply=true)
+
+proc processRelation(node: XmlNode) {.async.} =
+  var members: seq[MutableDatum] = @[]
+  var tags = newTable[string, MutableDatum]()
+
+  var
+    typ, role: string
+    referrence: int
+  for n in node.items:
+    if n.tag() == "tag":
+      tags[n.attr("k")] = &n.attr("v")
+    if n.tag() == "member":
+      typ = n.attr("type")
+      referrence = parseInt(n.attr("ref"))
+      role = n.attr(role)
+      members.add(&*{"type": typ, "ref": referrence, "role": role})
+
+  let
+    id = parseInt(node.attr("id"))
+    version = parseInt(node.attr("version"))
+    changeset = parseInt(node.attr("changeset"))
+  var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
+  ts.timezone = 0
+
+  var ret = await r.table("relations").get(id).run()
+
+  if ret.kind == JNull:
+    discard await r.table("relations").insert(&*{
+      "id": id,
+      "version": version,
+      "timestamp": ts,
+      "changeset": changeset,
+      "members": members
+    }).run(durability="soft", noreply=true)
+  elif ret["changeset"].num != changeset:
+    discard await r.table("relations").get(id).update(&*{
+      "version": version,
+      "timestamp": ts,
+      "changeset": changeset,
+      "members": members
+    }).run(durability="soft", noreply=true)
   else:
-    discard await r.table("nodes").get(id).update(&*{"timestamp": ts}).run()
+    discard
 
 proc main() {.async.} =
   for line in path.lines:
-    inc(counter)
-    stdout.write("\r")
-    stdout.write(counter)
-    stdout.flushFile
-    discard
-    if line =~ startNode or line =~ startWay or line =~ startRel:
+    #inc(counter)
+    #stdout.write("\r")
+    #stdout.write(counter)
+    #stdout.flushFile
+    if match(line, startNode) or match(line, startWay) or match(line, startRel):
       buffer = newStringStream()
       if line.endsWith("/>"):
         ok = true
 
-    if not ok and (line =~ endNode or line =~ endWay or line =~ endRel):
+    if not ok and (match(line, endNode) or match(line, endWay) or match(line, endRel)):
       ok = true
 
     if not isNil(buffer) and not isNil(buffer.data):
@@ -98,13 +177,12 @@ proc main() {.async.} =
       xmlnode = parseXml(buffer)
       buffer.close()
       if xmlnode.tag() == "node":
-        discard
         await processNode(xmlnode)
       elif xmlnode.tag() == "way":
-        echo "way"
+        await processWay(xmlnode)
       elif xmlnode.tag() == "relation":
-        echo "rel"
-  done = true
+        await processRelation(xmlnode)
+        done = true
   r.close()
 
 when isMainModule:
