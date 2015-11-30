@@ -182,7 +182,9 @@ proc main() {.async.} =
         await processWay(xmlnode)
       elif xmlnode.tag() == "relation":
         await processRelation(xmlnode)
-        done = true
+
+
+  done = true
   r.close()
 
 when isMainModule:
