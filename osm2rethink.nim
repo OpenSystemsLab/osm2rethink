@@ -1,4 +1,4 @@
-import os, pegs, strutils, streams, xmltree, xmlparser, stopwatch, asyncdispatch, tables, logging, json, times
+import os, pegs, strutils, streams, xmltree, xmlparser, stopwatch, tables, logging, json, times, threadpool
 import ../rethinkdb.nim/rethinkdb
 setLogFilter(lvlWarn)
 
@@ -28,19 +28,19 @@ if not fileExists(path):
   quit "File $# does not exists" % path, QuitFailure
 
 
-r = newRethinkclient(db="osm")
-waitFor r.connect()
-r.repl()
 
+var
+  ts {.threadvar.}: TimeInfo
 
 
 proc signalHandler() {.noconv.} =
   done = true
-
 setControlCHook(signalHandler)
 
+proc processNode(node: XmlNode) {.thread.} =
+  var r = newRethinkclient(db="osm")
+  r.connect()
 
-proc processNode(node: XmlNode) {.async.} =
   var tags = newTable[string, MutableDatum]()
   for n in node.items:
     tags[n.attr("k")] = &n.attr("v")
@@ -52,32 +52,34 @@ proc processNode(node: XmlNode) {.async.} =
     long = parseFloat(node.attr("lon"))
     lat = parseFloat(node.attr("lat"))
 
-  var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
+  #ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
   ts.timezone = 0
 
-  var ret = await r.table("nodes").get(id).run()
+  var ret = r.table("nodes").get(id).run(r)
 
   if ret.kind == JNull:
-    discard await r.table("nodes").insert(&*{
+    discard r.table("nodes").insert(&*{
       "id": id,
       "loc": r.point(long, lat),
       "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "tags": tags
-    }).run(durability="soft", noreply=true)
+    }).run(r, durability="soft", noreply=true)
   elif ret["changeset"].num != changeset:
-    discard await r.table("nodes").get(id).update(&*{
+    discard r.table("nodes").get(id).update(&*{
       "loc": r.point(long, lat),
       "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "tags": tags
-    }).run(durability="soft", noreply=true)
-#  else:
-#    discard await r.table("nodes").get(id).update(&*{"timestamp": ts}).run()
+    }).run(r, durability="soft", noreply=true)
 
-proc processWay(node: XmlNode) {.async.} =
+  r.close()
+
+proc processWay(node: XmlNode) {.thread.} =
+  var r = newRethinkclient(db="osm")
+  r.connect()
   var nodes: seq[int] = @[]
   var tags = newTable[string, MutableDatum]()
   for n in node.items:
@@ -93,25 +95,28 @@ proc processWay(node: XmlNode) {.async.} =
   var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
   ts.timezone = 0
 
-  var ret = await r.table("ways").get(id).run()
+  var ret = r.table("ways").get(id).run(r)
 
   if ret.kind == JNull:
-    discard await r.table("ways").insert(&*{
+    discard r.table("ways").insert(&*{
       "id": id,
       "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "nodes": nodes
-    }).run(durability="soft", noreply=true)
+    }).run(r, durability="soft", noreply=true)
   elif ret["changeset"].num != changeset:
-    discard await r.table("ways").get(id).update(&*{
+    discard  r.table("ways").get(id).update(&*{
       "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "nodes": nodes
-    }).run(durability="soft", noreply=true)
+    }).run(r, durability="soft", noreply=true)
+  r.close()
 
-proc processRelation(node: XmlNode) {.async.} =
+proc processRelation(node: XmlNode) {.thread.} =
+  var r = newRethinkclient(db="osm")
+  r.connect()
   var members: seq[MutableDatum] = @[]
   var tags = newTable[string, MutableDatum]()
 
@@ -134,32 +139,27 @@ proc processRelation(node: XmlNode) {.async.} =
   var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
   ts.timezone = 0
 
-  var ret = await r.table("relations").get(id).run()
+  var ret = r.table("relations").get(id).run(r)
 
   if ret.kind == JNull:
-    discard await r.table("relations").insert(&*{
+    discard r.table("relations").insert(&*{
       "id": id,
       "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "members": members
-    }).run(durability="soft", noreply=true)
+    }).run(r, durability="soft", noreply=true)
   elif ret["changeset"].num != changeset:
-    discard await r.table("relations").get(id).update(&*{
+    discard r.table("relations").get(id).update(&*{
       "version": version,
       "timestamp": ts,
       "changeset": changeset,
       "members": members
-    }).run(durability="soft", noreply=true)
-  else:
-    discard
+    }).run(r, durability="soft", noreply=true)
+  r.close()
 
-proc main() {.async.} =
+proc main() =
   for line in path.lines:
-    #inc(counter)
-    #stdout.write("\r")
-    #stdout.write(counter)
-    #stdout.flushFile
     if match(line, startNode) or match(line, startWay) or match(line, startRel):
       buffer = newStringStream()
       if line.endsWith("/>"):
@@ -177,22 +177,16 @@ proc main() {.async.} =
       xmlnode = parseXml(buffer)
       buffer.close()
       if xmlnode.tag() == "node":
-        await processNode(xmlnode)
+        spawn processNode(xmlnode)
       elif xmlnode.tag() == "way":
-        await processWay(xmlnode)
+        spawn processWay(xmlnode)
       elif xmlnode.tag() == "relation":
-        await processRelation(xmlnode)
-
-
-  done = true
-  r.close()
+        spawn processRelation(xmlnode)
 
 when isMainModule:
   var c: clock
   c.start()
-  asyncCheck main()
-  while not done:
-    poll()
+  main()
   c.stop()
   echo "\n"
   echo c.seconds, "s"
