@@ -1,7 +1,7 @@
 import os, pegs, strutils, streams, xmltree, xmlparser, stopwatch, tables, logging, json, times, threadpool
 import ../rethinkdb.nim/rethinkdb
 setLogFilter(lvlWarn)
-
+{.experimental.}
 let
   startNode = peg"\s* '<node'"
   endNode = peg"\s* '</node>'"
@@ -10,13 +10,11 @@ let
   startRel = peg"\s* '<relation'"
   endRel = peg"\s* '</relation>'"
 
-
 var
   buffer: StringStream
   xmlnode: XmlNode
   done = false
   ok = false
-  r: RethinkClient
   counter = 0
 
 
@@ -27,19 +25,26 @@ let path = paramStr(1)
 if not fileExists(path):
   quit "File $# does not exists" % path, QuitFailure
 
-
-
 var
-  ts {.threadvar.}: TimeInfo
-
+  r {.threadvar.}: RethinkClient
 
 proc signalHandler() {.noconv.} =
   done = true
 setControlCHook(signalHandler)
 
+proc parseTime(t: string): TimeInfo =
+  if t =~ peg"{\d+} '-' {\d+} '-' {\d+} 'T' {\d+} ':' {\d+} ':' {\d+}":
+    result.year = parseInt(matches[0])
+    result.month = cast[Month](parseInt(matches[1])-1)
+    result.monthday = parseInt(matches[2])
+    result.hour = parseInt(matches[3])
+    result.minute = parseInt(matches[4])
+    result.second = parseInt(matches[5])
+
 proc processNode(node: XmlNode) {.thread.} =
-  var r = newRethinkclient(db="osm")
-  r.connect()
+  if r.isNil:
+    r = newRethinkclient(db="osm")
+    r.connect()
 
   var tags = newTable[string, MutableDatum]()
   for n in node.items:
@@ -51,9 +56,7 @@ proc processNode(node: XmlNode) {.thread.} =
     changeset = parseInt(node.attr("changeset"))
     long = parseFloat(node.attr("lon"))
     lat = parseFloat(node.attr("lat"))
-
-  #ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
-  ts.timezone = 0
+    ts = parseTime(node.attr("timestamp"))
 
   var ret = r.table("nodes").get(id).run(r)
 
@@ -75,11 +78,10 @@ proc processNode(node: XmlNode) {.thread.} =
       "tags": tags
     }).run(r, durability="soft", noreply=true)
 
-  r.close()
-
 proc processWay(node: XmlNode) {.thread.} =
-  var r = newRethinkclient(db="osm")
-  r.connect()
+  if r.isNil:
+    r = newRethinkclient(db="osm")
+    r.connect()
   var nodes: seq[int] = @[]
   var tags = newTable[string, MutableDatum]()
   for n in node.items:
@@ -92,8 +94,7 @@ proc processWay(node: XmlNode) {.thread.} =
     id = parseInt(node.attr("id"))
     version = parseInt(node.attr("version"))
     changeset = parseInt(node.attr("changeset"))
-  var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
-  ts.timezone = 0
+    ts = parseTime(node.attr("timestamp"))
 
   var ret = r.table("ways").get(id).run(r)
 
@@ -112,11 +113,12 @@ proc processWay(node: XmlNode) {.thread.} =
       "changeset": changeset,
       "nodes": nodes
     }).run(r, durability="soft", noreply=true)
-  r.close()
 
 proc processRelation(node: XmlNode) {.thread.} =
-  var r = newRethinkclient(db="osm")
-  r.connect()
+  if r.isNil:
+    r = newRethinkclient(db="osm")
+    r.connect()
+
   var members: seq[MutableDatum] = @[]
   var tags = newTable[string, MutableDatum]()
 
@@ -136,8 +138,7 @@ proc processRelation(node: XmlNode) {.thread.} =
     id = parseInt(node.attr("id"))
     version = parseInt(node.attr("version"))
     changeset = parseInt(node.attr("changeset"))
-  var ts = parse(node.attr("timestamp"), "yyyy-MM-ddThh:mm:ss")
-  ts.timezone = 0
+    ts = parseTime(node.attr("timestamp"))
 
   var ret = r.table("relations").get(id).run(r)
 
@@ -156,34 +157,36 @@ proc processRelation(node: XmlNode) {.thread.} =
       "changeset": changeset,
       "members": members
     }).run(r, durability="soft", noreply=true)
-  r.close()
 
 proc main() =
-  for line in path.lines:
-    if match(line, startNode) or match(line, startWay) or match(line, startRel):
-      buffer = newStringStream()
-      if line.endsWith("/>"):
+  parallel:
+    for line in path.lines:
+      if match(line, startNode) or match(line, startWay) or match(line, startRel):
+        buffer = newStringStream()
+        if line.endsWith("/>"):
+          ok = true
+
+      if not ok and (match(line, endNode) or match(line, endWay) or match(line, endRel)):
         ok = true
 
-    if not ok and (match(line, endNode) or match(line, endWay) or match(line, endRel)):
-      ok = true
+      if not isNil(buffer) and not isNil(buffer.data):
+        buffer.write(line)
 
-    if not isNil(buffer) and not isNil(buffer.data):
-      buffer.write(line)
-
-    if ok:
-      ok = false
-      buffer.setPosition(0)
-      xmlnode = parseXml(buffer)
-      buffer.close()
-      if xmlnode.tag() == "node":
-        spawn processNode(xmlnode)
-      elif xmlnode.tag() == "way":
-        spawn processWay(xmlnode)
-      elif xmlnode.tag() == "relation":
-        spawn processRelation(xmlnode)
+      if ok:
+        ok = false
+        buffer.setPosition(0)
+        xmlnode = parseXml(buffer)
+        buffer.close()
+        if xmlnode.tag() == "node":
+          spawn processNode(xmlnode)
+        elif xmlnode.tag() == "way":
+          spawn processWay(xmlnode)
+        elif xmlnode.tag() == "relation":
+          spawn processRelation(xmlnode)
+  sync()
 
 when isMainModule:
+  setMinPoolSize(8)
   var c: clock
   c.start()
   main()
