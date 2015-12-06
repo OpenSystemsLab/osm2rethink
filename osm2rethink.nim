@@ -1,4 +1,4 @@
-import os, pegs, strutils, streams, xmltree, xmlparser, stopwatch, tables, logging, json, times, threadpool
+import os, pegs, strutils, streams, xmltree, xmlparser, stopwatch, tables, logging, json, times, threadpool, lapp, sequtils
 import ../rethinkdb.nim/rethinkdb
 setLogFilter(lvlWarn)
 {.experimental.}
@@ -10,6 +10,16 @@ let
   startRel = peg"\s* '<relation'"
   endRel = peg"\s* '</relation>'"
 
+
+  help = """
+osm2rethink [-c HOST:PORT] [-a AUTH_KEY] database filenames
+
+  -h, --help  print this help
+  -c,--connect (default localhost:28015) host and client port of a rethinkdb node to connect to
+  -a,--auth  AUTH_KEY authorization key for rethinkdb client
+  <database> Database to write to
+  <files>: (default stdin...)  OSM files to be imported
+"""
 var
   buffer: StringStream
   xmlnode: XmlNode
@@ -17,13 +27,6 @@ var
   ok = false
   counter = 0
 
-
-
-if paramCount() < 1:
-  quit "Usage: osm2rethink uri osm-path", QuitFailure
-let path = paramStr(1)
-if not fileExists(path):
-  quit "File $# does not exists" % path, QuitFailure
 
 var
   r {.threadvar.}: RethinkClient
@@ -40,6 +43,7 @@ proc parseTime(t: string): TimeInfo =
     result.hour = parseInt(matches[3])
     result.minute = parseInt(matches[4])
     result.second = parseInt(matches[5])
+    result.timezone = 0
 
 proc processNode(node: XmlNode) {.thread.} =
   if r.isNil:
@@ -159,7 +163,19 @@ proc processRelation(node: XmlNode) {.thread.} =
     }).run(r, durability="soft", noreply=true)
 
 proc main() =
-  parallel:
+  var args = lapp.parse(help)
+
+  if args.getOrDefault("h").asBool or args.getOrDefault("help").asBool:
+    quit help, QuitSuccess
+
+  var paths = args.getOrDefault("files").asSeq.map(proc(x: ValueRef): string = x.filename)
+  echo paths
+  quit()
+  for path in paths:
+    if not fileExists(path):
+      quit "File $# does not exists" % path, QuitFailure
+
+  for path in paths:
     for line in path.lines:
       if match(line, startNode) or match(line, startWay) or match(line, startRel):
         buffer = newStringStream()
